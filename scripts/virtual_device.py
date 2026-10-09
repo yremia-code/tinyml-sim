@@ -1,5 +1,7 @@
 import paho.mqtt.client as mqtt
 import json, os, hashlib, requests, time, threading, tempfile
+import numpy as np
+import joblib
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,10 +14,15 @@ TOKEN   = os.getenv("DEVICE_TOKEN")
 TMP = tempfile.gettempdir()
 STATE_FILE = os.path.join(TMP, f"{NAME}_state.json")
 
+# Path test set (relatif ke root repo)
+BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+TEST_SAMPLES = os.path.join(BASE, "data", "test_samples.npy")
+TEST_LABELS  = os.path.join(BASE, "data", "test_labels.npy")
+
 def load_state():
     if os.path.exists(STATE_FILE):
         return json.load(open(STATE_FILE))
-    return {"current_version": "1.0.0", "model_path": None}
+    return {"current_version": "0.0.0", "model_path": None, "accuracy": None}
 
 def save_state(s):
     json.dump(s, open(STATE_FILE, "w"))
@@ -34,13 +41,24 @@ def download(url, dest):
         for chunk in r.iter_content(8192):
             f.write(chunk)
 
+def run_inference(model_path):
+    """Load model kNN (.pkl), run inference di 30 test sample, return accuracy."""
+    model = joblib.load(model_path)
+    X = np.load(TEST_SAMPLES)
+    y = np.load(TEST_LABELS)
+
+    preds = model.predict(X)
+    acc = float((preds == y).mean())
+    return acc
+
 state = load_state()
 
-def publish_status(client, version, status, error=""):
+def publish_status(client, version, status, error="", accuracy=None):
     payload = {
         "current_model_version": version,
         "update_status": status,
         "last_error": error,
+        "test_accuracy": accuracy if accuracy is not None else state.get("accuracy"),
         "ts": int(time.time() * 1000)
     }
     client.publish("v1/devices/me/telemetry", json.dumps(payload))
@@ -55,17 +73,22 @@ def handle_update(client, attrs):
         return
 
     print(f"[{NAME}] update {state['current_version']} -> {desired}")
-    dest = os.path.join(TMP, f"{NAME}_model_{desired}.tflite")
+    dest = os.path.join(TMP, f"{NAME}_model_{desired}.pkl")
     try:
         download(url, dest)
         got = sha256_file(dest)
         if got != sha:
             raise Exception(f"checksum mismatch: {got} != {sha}")
-        time.sleep(1)
+
+        acc = run_inference(dest)
+        print(f"[{NAME}] inference OK, accuracy={acc:.4f}")
+
         state["current_version"] = desired
         state["model_path"] = dest
+        state["accuracy"] = acc
         save_state(state)
-        publish_status(client, desired, "success")
+
+        publish_status(client, desired, "success", accuracy=acc)
     except Exception as e:
         publish_status(client, state["current_version"], "failed", str(e))
 
