@@ -1,5 +1,5 @@
 import paho.mqtt.client as mqtt
-import json, os, hashlib, requests, time, threading, tempfile
+import json, os, hashlib, requests, time, threading, tempfile, random
 import numpy as np
 import joblib
 from dotenv import load_dotenv
@@ -14,10 +14,14 @@ TOKEN   = os.getenv("DEVICE_TOKEN")
 TMP = tempfile.gettempdir()
 STATE_FILE = os.path.join(TMP, f"{NAME}_state.json")
 
-# Path test set (relatif ke root repo)
 BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TEST_SAMPLES = os.path.join(BASE, "data", "test_samples.npy")
 TEST_LABELS  = os.path.join(BASE, "data", "test_labels.npy")
+
+LABELS = ["no_irrigation", "light_irrigation", "heavy_irrigation"]
+
+# Cache model yang sedang aktif biar nggak load ulang tiap inference
+_active_model = {"path": None, "model": None}
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -41,14 +45,27 @@ def download(url, dest):
         for chunk in r.iter_content(8192):
             f.write(chunk)
 
-def run_inference(model_path):
-    """Load model kNN (.pkl), run inference di 30 test sample, return accuracy."""
+def get_active_model():
+    """Load model dari disk kalau belum di-cache."""
+    if state["model_path"] is None:
+        return None
+    if _active_model["path"] == state["model_path"]:
+        return _active_model["model"]
+    try:
+        m = joblib.load(state["model_path"])
+        _active_model["path"] = state["model_path"]
+        _active_model["model"] = m
+        return m
+    except Exception as e:
+        print(f"[{NAME}] load model error: {e}")
+        return None
+
+def run_accuracy_test(model_path):
+    """Test akurasi model di 300 sample test."""
     model = joblib.load(model_path)
     X = np.load(TEST_SAMPLES)
     y = np.load(TEST_LABELS)
-
-    preds = model.predict(X)
-    acc = float((preds == y).mean())
+    acc = float((model.predict(X) == y).mean())
     return acc
 
 state = load_state()
@@ -80,13 +97,17 @@ def handle_update(client, attrs):
         if got != sha:
             raise Exception(f"checksum mismatch: {got} != {sha}")
 
-        acc = run_inference(dest)
-        print(f"[{NAME}] inference OK, accuracy={acc:.4f}")
+        acc = run_accuracy_test(dest)
+        print(f"[{NAME}] accuracy test OK, accuracy={acc:.4f}")
 
         state["current_version"] = desired
         state["model_path"] = dest
         state["accuracy"] = acc
         save_state(state)
+
+        # Reset cache biar model baru di-load pas inference berikutnya
+        _active_model["path"] = None
+        _active_model["model"] = None
 
         publish_status(client, desired, "success", accuracy=acc)
     except Exception as e:
@@ -110,6 +131,43 @@ def heartbeat(client):
         publish_status(client, state["current_version"], "running")
         time.sleep(30)
 
+def inference_loop(client):
+    """Loop utama: tiap 10 detik baca sensor, klasifikasi, kirim hasil."""
+    time.sleep(5)  # tunggu device connect dulu
+    while True:
+        model = get_active_model()
+        if model is None:
+            print(f"[{NAME}] belum ada model, skip inference")
+            time.sleep(10)
+            continue
+
+        # Simulasi baca sensor — kondisi random
+        sensor = {
+            "soil_moisture": round(random.uniform(15, 85), 1),
+            "temperature":   round(random.uniform(20, 40), 1),
+            "humidity":      round(random.uniform(30, 90), 1),
+            "soil_ph":       round(random.uniform(5.0, 7.5), 2)
+        }
+
+        # Inference
+        X = [[sensor["soil_moisture"], sensor["temperature"],
+              sensor["humidity"], sensor["soil_ph"]]]
+        pred = int(model.predict(X)[0])
+        decision = LABELS[pred]
+
+        # Kirim ke ThingsBoard
+        payload = {
+            **sensor,
+            "decision": decision,
+            "decision_code": pred,
+            "model_version": state["current_version"],
+            "ts": int(time.time() * 1000)
+        }
+        client.publish("v1/devices/me/telemetry", json.dumps(payload))
+        print(f"[{NAME}] SENSOR: {sensor} -> KEPUTUSAN: {decision} (model v{state['current_version']})")
+
+        time.sleep(10)
+
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=NAME)
 client.username_pw_set(TOKEN)
 client.on_connect = on_connect
@@ -117,4 +175,5 @@ client.on_message = on_message
 client.connect(TB_HOST, TB_PORT, 60)
 
 threading.Thread(target=heartbeat, args=(client,), daemon=True).start()
+threading.Thread(target=inference_loop, args=(client,), daemon=True).start()
 client.loop_forever()
